@@ -28,6 +28,7 @@ const PROD_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const QUOTA_PATH: &str = "/v1internal:retrieveUserQuotaSummary";
 const LOAD_CODE_ASSIST_PATH: &str = "/v1internal:loadCodeAssist";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const QUOTA_USER_AGENT: &str = "antigravity";
@@ -53,6 +54,9 @@ pub struct Endpoints {
     pub quota: Vec<String>,
     pub load_code_assist: Vec<String>,
     pub token: String,
+    /// OpenID userinfo, asked only for the address of a saved session that
+    /// does not name its own.
+    pub userinfo: String,
 }
 
 impl Default for Endpoints {
@@ -67,6 +71,7 @@ impl Default for Endpoints {
                 format!("{PROD_BASE}{LOAD_CODE_ASSIST_PATH}"),
             ],
             token: TOKEN_URL.to_string(),
+            userinfo: USERINFO_URL.to_string(),
         }
     }
 }
@@ -214,6 +219,32 @@ pub async fn fetch_plan(
         return plan_from_value(&value);
     }
     None
+}
+
+/// Best-effort address of the signed-in Google account, from OpenID
+/// userinfo. Only labels the snapshot, so any failure is `None`.
+pub async fn fetch_email(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    access_token: &str,
+) -> Option<String> {
+    let resp = client
+        .get(&endpoints.userinfo)
+        .bearer_auth(access_token)
+        .timeout(HTTP_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = read_body_capped(resp, MAX_BODY_BYTES).await.ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value["email"]
+        .as_str()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(str::to_string)
 }
 
 fn plan_from_value(value: &serde_json::Value) -> Option<String> {
@@ -458,6 +489,7 @@ mod tests {
             quota: vec![format!("{base}/daily/quota"), format!("{base}/prod/quota")],
             load_code_assist: vec![format!("{base}/daily/plan"), format!("{base}/prod/plan")],
             token: format!("{base}/token"),
+            userinfo: format!("{base}/userinfo"),
         }
     }
 
@@ -529,6 +561,35 @@ mod tests {
         assert_eq!(value["response"]["buckets"][0]["remainingFraction"], 0.5);
         daily.assert_async().await;
         prod.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn email_comes_from_userinfo_and_any_failure_is_none() {
+        let mut server = mockito::Server::new_async().await;
+        let ok = server
+            .mock("GET", "/userinfo")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(r#"{"sub":"1","email":" someone@example.test "}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        assert_eq!(
+            fetch_email(&client, &endpoints(&server), "AT")
+                .await
+                .as_deref(),
+            Some("someone@example.test")
+        );
+        ok.assert_async().await;
+
+        server
+            .mock("GET", "/userinfo")
+            .match_header("authorization", "Bearer BAD")
+            .with_status(401)
+            .create_async()
+            .await;
+        assert_eq!(fetch_email(&client, &endpoints(&server), "BAD").await, None);
     }
 
     #[tokio::test]

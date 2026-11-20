@@ -224,6 +224,11 @@ fn build_tabs(config: &Config, desktop_labels: &[String]) -> Vec<TabId> {
             for account in &config.openai.accounts {
                 tabs.push(TabId::account_for(vendor, account.label.clone()));
             }
+        } else if vendor == VendorId::Antigravity {
+            tabs.push(TabId::vendor(vendor));
+            for account in &config.antigravity.accounts {
+                tabs.push(TabId::account_for(vendor, account.label.clone()));
+            }
         } else {
             tabs.push(TabId::vendor(vendor));
         }
@@ -927,11 +932,27 @@ async fn build_outcome_with_ttl(
         VendorId::Antigravity => {
             // No API key: the local Antigravity server is the source, and the
             // saved Google session stands in while nothing is running.
-            let cache = crate::cache::Cache::for_vendor("antigravity")?;
             let oauth = crate::antigravity::cloud::OauthClient::from_config(
                 config.antigravity.oauth_client_id.as_deref(),
                 config.antigravity.oauth_client_secret.as_deref(),
             );
+            // A named account is one saved session, read from its own token
+            // file; the default tab keeps "whichever product is running".
+            if let Some(label) = tab.account.as_deref() {
+                let path = config.antigravity.token_path(label)?;
+                let blob = std::fs::read_to_string(&path).map_err(|e| AppError::io_at(&path, e))?;
+                let cache = crate::cache::Cache::for_vendor_account("antigravity", label)?;
+                let outcome = crate::antigravity::fetch::fetch_saved_session(
+                    client,
+                    &cache,
+                    ttl,
+                    oauth.as_ref(),
+                    &blob,
+                )
+                .await?;
+                return Ok(outcome.into());
+            }
+            let cache = crate::cache::Cache::for_vendor("antigravity")?;
             let outcome =
                 crate::antigravity::fetch_snapshot(client, &cache, ttl, oauth.as_ref()).await?;
             Ok(outcome.into())

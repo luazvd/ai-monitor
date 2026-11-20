@@ -15,6 +15,15 @@
 //! locked store, a denied ACL — is `Ok(None)`, because the caller has a better
 //! message for "no session" than anything the backend produces, and the vendor
 //! must keep working when the keyring is simply unavailable.
+//!
+//! When Antigravity cannot use the keyring either (a locked Secret Service
+//! collection is common on Linux), it falls back to plain files under
+//! `~/.gemini`, one per product: `agy` writes
+//! `antigravity-cli/antigravity-oauth-token` and the desktop app writes
+//! `jetski-standalone-oauth-token`. They hold the same JSON as the keyring
+//! value, so [`read_saved`] consults them after the keyring. Because each
+//! product keeps its own file, the two can be signed in to different Google
+//! accounts.
 
 use std::fmt::Write as _;
 
@@ -30,6 +39,13 @@ pub const KEYRING_SERVICE: &str = "gemini";
 pub const KEYRING_ACCOUNT: &str = "antigravity";
 /// Prefix `go-keyring` adds when it had to base64-wrap the value.
 pub const GO_KEYRING_PREFIX: &str = "go-keyring-base64:";
+
+/// Token file `agy` writes, relative to the home directory, when the keyring
+/// is unavailable.
+pub const CLI_TOKEN_FILE: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
+/// Token file the desktop app writes, relative to the home directory, when the
+/// keyring is unavailable.
+pub const DESKTOP_TOKEN_FILE: &str = ".gemini/jetski-standalone-oauth-token";
 
 /// Upper bound on the blob a keyring may hand back. A real token blob is
 /// well under 4 KiB; anything larger is not something this module parses.
@@ -63,6 +79,9 @@ pub struct StoredToken {
     /// refresh to this sign-in, so a re-login never gets the old session's
     /// cached access token.
     pub fingerprint: String,
+    /// The signed-in Google address, when the blob names it — as a plain
+    /// `email` field or inside an `id_token`. Unverified; a label only.
+    pub email: Option<String>,
 }
 
 /// Decode the raw keyring value into a [`StoredToken`].
@@ -113,12 +132,18 @@ pub fn parse_keyring_blob(raw: &str) -> Result<StoredToken> {
         .filter_map(|key| token.get(key))
         .find_map(parse_expiry);
     let fingerprint = fingerprint_of(refresh_token.as_deref().unwrap_or(&access_token));
+    let email = first_string(&root, &["email"]).or_else(|| {
+        let id_token = first_string(&root, &["id_token", "idToken"])?;
+        let claims = crate::jwt::claims(&id_token)?;
+        first_string(&claims, &["email"])
+    });
 
     Ok(StoredToken {
         access_token,
         refresh_token,
         expires_at,
         fingerprint,
+        email,
     })
 }
 
@@ -173,6 +198,37 @@ fn fingerprint_of(secret: &str) -> String {
 /// see the module docs.
 pub fn read() -> Result<Option<String>> {
     Ok(read_platform())
+}
+
+/// The saved session from the keyring, or failing that from the token files
+/// Antigravity writes when it cannot use the keyring. `prefer_cli` puts
+/// `agy`'s file first — the caller knows `agy` is the product running.
+/// Never errors, for the same reason as [`read`].
+pub fn read_saved(prefer_cli: bool) -> Option<String> {
+    read_platform().or_else(|| {
+        let home = crate::cache::home_dir().ok()?;
+        read_token_files(&home, prefer_cli)
+    })
+}
+
+/// Test seam for the file half of [`read_saved`]: the first readable token
+/// file under `home`. Without a preference the most recently written file
+/// wins, since that is the sign-in the user made last.
+pub fn read_token_files(home: &std::path::Path, prefer_cli: bool) -> Option<String> {
+    let mut files: Vec<_> = [CLI_TOKEN_FILE, DESKTOP_TOKEN_FILE]
+        .iter()
+        .map(|rel| home.join(rel))
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            Some((path, modified))
+        })
+        .collect();
+    if !prefer_cli {
+        files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    }
+    files
+        .into_iter()
+        .find_map(|(path, _)| decode_blob_bytes(&std::fs::read(path).ok()?))
 }
 
 /// A keyring value as bytes → text. `go-keyring` writes UTF-8; a credential
@@ -461,6 +517,74 @@ mod tests {
         assert_eq!(decode_blob_bytes(&[0xff, 0xfe, 0xfd]), None);
         assert_eq!(decode_blob_bytes(&[0xc3, 0x28]), None);
         assert_eq!(decode_blob_bytes(&vec![b'a'; MAX_BLOB_BYTES + 1]), None);
+    }
+
+    fn id_token(claims: &str) -> String {
+        format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims)
+        )
+    }
+
+    #[test]
+    fn email_comes_from_the_id_token_beside_the_nested_token() {
+        let blob = format!(
+            r#"{{"auth_method":"consumer","id_token":"{}","token":{{"access_token":"at"}}}}"#,
+            id_token(r#"{"email":"cli@example.test"}"#)
+        );
+        let token = parse_keyring_blob(&blob).unwrap();
+        assert_eq!(token.email.as_deref(), Some("cli@example.test"));
+    }
+
+    #[test]
+    fn a_plain_email_field_wins_and_none_is_fine() {
+        let blob = format!(
+            r#"{{"email":"plain@example.test","id_token":"{}","access_token":"at"}}"#,
+            id_token(r#"{"email":"jwt@example.test"}"#)
+        );
+        assert_eq!(
+            parse_keyring_blob(&blob).unwrap().email.as_deref(),
+            Some("plain@example.test")
+        );
+        let bare = parse_keyring_blob(r#"{"access_token":"at","id_token":"garbage"}"#).unwrap();
+        assert_eq!(bare.email, None);
+    }
+
+    fn write_token_file(home: &std::path::Path, rel: &str, body: &str, age_secs: u64) {
+        let path = home.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    #[test]
+    fn token_files_prefer_agy_when_asked_else_the_newest() {
+        let td = tempfile::tempdir().unwrap();
+        write_token_file(td.path(), CLI_TOKEN_FILE, "cli", 600);
+        write_token_file(td.path(), DESKTOP_TOKEN_FILE, "desktop", 60);
+        assert_eq!(read_token_files(td.path(), true).as_deref(), Some("cli"));
+        assert_eq!(
+            read_token_files(td.path(), false).as_deref(),
+            Some("desktop")
+        );
+    }
+
+    #[test]
+    fn token_files_fall_through_a_missing_or_empty_file() {
+        let td = tempfile::tempdir().unwrap();
+        assert_eq!(read_token_files(td.path(), true), None);
+        write_token_file(td.path(), CLI_TOKEN_FILE, "", 0);
+        write_token_file(td.path(), DESKTOP_TOKEN_FILE, "desktop", 60);
+        assert_eq!(
+            read_token_files(td.path(), true).as_deref(),
+            Some("desktop")
+        );
     }
 
     /// Touches the real Credential Manager; asserts only that the read does

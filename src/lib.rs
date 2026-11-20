@@ -114,6 +114,8 @@ pub mod report;
 pub mod safe_storage;
 #[path = "core/serde_helpers.rs"]
 pub mod serde_helpers;
+#[path = "core/sessions.rs"]
+pub mod sessions;
 #[path = "providers/supergrok/mod.rs"]
 pub mod supergrok;
 #[path = "core/theme.rs"]

@@ -71,7 +71,7 @@ impl From<FetchOutcome> for crate::vendor::VendorOutcome {
 /// `None` would have to mean otherwise.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SavedCredential<'a> {
-    /// Read the OS keyring, as production does.
+    /// Read the OS keyring, then Antigravity's token files, as production does.
     #[default]
     Keyring,
     /// Use this raw blob.
@@ -107,6 +107,32 @@ pub async fn fetch_snapshot(
         cache_ttl,
         oauth,
         RemoteOverride::default(),
+        Utc::now(),
+    )
+    .await
+}
+
+/// Quota for one saved Google session — a token file one Antigravity product
+/// wrote — straight from the Cloud Code API. No local server is consulted:
+/// each answers for the account its own product is signed in to, which need
+/// not be this session's. `cache` must be this session's own.
+pub async fn fetch_saved_session(
+    client: &reqwest::Client,
+    cache: &Cache,
+    cache_ttl: Duration,
+    oauth: Option<&cloud::OauthClient>,
+    blob: &str,
+) -> Result<FetchOutcome> {
+    fetch_snapshot_at(
+        client,
+        cache,
+        cache_ttl,
+        oauth,
+        RemoteOverride {
+            credential: SavedCredential::Blob(blob),
+            endpoints: None,
+            local_bases: Some(Vec::new()),
+        },
         Utc::now(),
     )
     .await
@@ -382,7 +408,9 @@ fn saved_session(
     reason: RemoteFallbackReason,
 ) -> Result<StoredToken> {
     let raw = match credential {
-        SavedCredential::Keyring => credential::read()?,
+        SavedCredential::Keyring => {
+            credential::read_saved(matches!(reason, RemoteFallbackReason::AgyMissingCsrf))
+        }
         SavedCredential::Blob(blob) => Some(blob.to_string()),
         SavedCredential::Absent => None,
     };
@@ -540,6 +568,10 @@ async fn fetch_remote(
         .unwrap_or_else(|| DEFAULT_PLAN.to_string());
     let mut snap = parse_quota_summary(&quota, plan)?;
     snap.account = remote_account(&token.fingerprint);
+    snap.user_email = match token.email {
+        Some(email) => Some(email),
+        None => cloud::fetch_email(client, endpoints, &access.value).await,
+    };
     snap.source = AntigravitySource::Remote;
     Ok(snap)
 }
@@ -2611,6 +2643,7 @@ mod tests {
             quota: vec![format!("{base}/daily/quota"), format!("{base}/prod/quota")],
             load_code_assist: vec![format!("{base}/daily/plan"), format!("{base}/prod/plan")],
             token: format!("{base}/token"),
+            userinfo: format!("{base}/userinfo"),
         }
     }
 
@@ -2769,7 +2802,10 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let blob = keyring_blob(VALID, true);
+        // `agy`'s token file carries its sign-in as an `email` beside the token.
+        let mut blob: serde_json::Value = serde_json::from_str(&keyring_blob(VALID, true)).unwrap();
+        blob["email"] = serde_json::json!("cli@example.test");
+        let blob = blob.to_string();
         let (_td, cache) = fixture();
 
         let outcome = run(
@@ -2789,6 +2825,10 @@ mod tests {
         quota.assert_async().await;
         plan.assert_async().await;
         assert_eq!(outcome.snapshot.source, AntigravitySource::Remote);
+        assert_eq!(
+            outcome.snapshot.user_email.as_deref(),
+            Some("cli@example.test")
+        );
     }
 
     #[tokio::test]

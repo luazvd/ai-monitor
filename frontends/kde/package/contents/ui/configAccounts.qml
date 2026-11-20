@@ -121,6 +121,7 @@ KCM.SimpleKCM {
                 page.statusMessage = Logic.safeText(data["stderr"] || i18n("ai-monitor failed"), 200);
                 return;
             }
+            page.statusMessage = Logic.safeText(data["stdout"] || i18n("Account removed."), 200);
             refreshAll();
         }
         function exec(cmd) {

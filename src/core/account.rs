@@ -85,6 +85,7 @@ fn remove(label: &str) -> i32 {
     }
 
     let mut removed_any = false;
+    let mut failed = false;
 
     // 1. Remove from snapshot store
     match crate::account_store::remove_snapshot(target) {
@@ -95,14 +96,29 @@ fn remove(label: &str) -> i32 {
         Ok(false) => {}
         Err(e) => {
             eprintln!("ai-monitor account: error removing snapshot: {e}");
+            failed = true;
         }
     }
 
     // 2. Remove from config.toml if present in [[accounts]]
-    if let Some(config_path) = crate::config::resolved_path()
-        && let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>()
-    {
+    if let Some(config_path) = crate::config::resolved_path() {
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                eprintln!("ai-monitor account: failed to read {}: {e}", config_path.display());
+                failed = true;
+                String::new()
+            }
+        };
+        let mut doc = match content.parse::<toml_edit::DocumentMut>() {
+            Ok(doc) => doc,
+            Err(e) => {
+                eprintln!("ai-monitor account: failed to parse {}: {e}", config_path.display());
+                failed = true;
+                toml_edit::DocumentMut::new()
+            }
+        };
         let mut mutated = false;
         if let Some(arr) = doc
             .get_mut("accounts")
@@ -121,6 +137,7 @@ fn remove(label: &str) -> i32 {
         if mutated {
             if let Err(e) = crate::cache::atomic_write(&config_path, doc.to_string().as_bytes()) {
                 eprintln!("ai-monitor account: failed to save updated config: {e}");
+                failed = true;
             } else {
                 println!("Removed account '{target}' from config.toml.");
             }
@@ -137,11 +154,13 @@ fn remove(label: &str) -> i32 {
     // 4. Request waybar / widget refresh
     crate::waybar::request_refresh();
 
-    if removed_any {
+    if failed {
+        1
+    } else if removed_any {
         0
     } else {
         eprintln!("ai-monitor account: no account found matching '{target}'");
-        0
+        1
     }
 }
 

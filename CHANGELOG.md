@@ -11,6 +11,15 @@ Each release is also published at
 
 ### Added
 
+- **Every signed-in session is monitored at once.** Two logins of one
+  provider, whether terminal and desktop or two terminals, now each show
+  their own account. Claude Code and Codex sessions run with another
+  `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are found in the running processes and
+  remembered until their login file is gone; Antigravity's `agy` and desktop
+  app are read from their own token files. A session signed in to the same
+  account as the default login is skipped, so one account is never fetched
+  twice. New `[[antigravity.accounts]]` (`label`, `token_path`) lists extra
+  Antigravity sign-ins by hand.
 - **`[display]` panel layout, shared by every frontend.** `bar_mode`
   (`expanded` side by side, or `carousel` one at a time), `bar_count`,
   `bar_unit` (`provider` or `account`), `carousel_interval`, `hover_mode`
@@ -87,6 +96,14 @@ Each release is also published at
 
 ### Fixed
 
+- **Antigravity finds its saved session when the keyring is locked.** With
+  no usable keyring (a locked Secret Service collection on Linux), Antigravity
+  saves its sign-in to files under `~/.gemini` instead: one for `agy`, one for
+  the desktop app. ai-monitor now reads those after the keyring, preferring
+  `agy`'s file when `agy` is the product running, so a running `agy` session
+  no longer ends in "requires a CSRF token". The remote snapshot is labelled
+  with the account's email, so desktop and `agy` signed in to different
+  Google accounts keep separate account entries.
 - Account mode drew accounts that were only logged in, not in use, to fill
   `bar_count`. Only the active account and accounts with a current session
   appear now; the others are still monitored for renewals.

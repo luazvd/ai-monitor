@@ -478,11 +478,111 @@ async fn collect_entries(
         }
     }
 
+    if provider.is_none() && config.ui.multi_account() {
+        refresh_extra_sessions(&client, &config, refresh).await;
+    }
+
     Ok((
         entries,
         config.ui.primary.map(|vendor| vendor.slug()),
         account_info,
     ))
+}
+
+/// Refresh every signed-in session beyond each vendor's default one (see
+/// [`crate::sessions`]) and file its usage under the account it belongs to.
+///
+/// A session signed in to the same account as the default login is skipped
+/// before any request, when its identity is known offline, so one account
+/// is never fetched (or its token refreshed) twice. One whose identity is
+/// only learned from the fetch is deduplicated after it. What is left is
+/// recorded as a live session, so the panel shows every account in use at
+/// once rather than only the one the default login holds.
+async fn refresh_extra_sessions(client: &reqwest::Client, config: &Config, refresh: bool) {
+    use crate::vendor::VendorId;
+
+    let sessions = crate::sessions::discover(config);
+    let mut cfg = config.clone();
+    for session in &sessions {
+        match session.vendor {
+            VendorId::Anthropic => cfg
+                .anthropic
+                .accounts
+                .push(crate::config::AnthropicAccount {
+                    label: session.label.clone(),
+                    credentials_path: session.path.clone(),
+                }),
+            VendorId::Openai => cfg.openai.accounts.push(crate::config::OpenAiAccount {
+                label: session.label.clone(),
+                codex_auth_path: session.path.clone(),
+            }),
+            VendorId::Antigravity => {
+                cfg.antigravity
+                    .accounts
+                    .push(crate::config::AntigravityAccount {
+                        label: session.label.clone(),
+                        token_path: session.path.clone(),
+                    });
+            }
+            _ => {}
+        }
+    }
+
+    let ttl = if refresh {
+        std::time::Duration::ZERO
+    } else {
+        crate::cache::DEFAULT_TTL
+    };
+    let mut live: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for session in sessions {
+        if !config.is_enabled(session.vendor) {
+            continue;
+        }
+        let slug = session.vendor.slug();
+        let primary = crate::account_store::detect_provider_email(slug, config);
+        let same_as_primary = |identity: &str| {
+            primary
+                .as_deref()
+                .is_some_and(|p| crate::account_store::accounts_match_or_prefix(p, identity))
+        };
+        if session.identity.as_deref().is_some_and(same_as_primary) {
+            continue;
+        }
+
+        let tab = TabId::account_for(session.vendor, session.label.clone());
+        let state = crate::tui::app::refresh_one_live_with_ttl(client, &cfg, &tab, ttl).await;
+        let identity = match &state {
+            TabState::Ready(ready) => session
+                .identity
+                .clone()
+                .or_else(|| ready.snapshot.user_email().map(str::to_string)),
+            _ => None,
+        };
+        let Some(identity) = identity else {
+            continue;
+        };
+        if same_as_primary(&identity) {
+            continue;
+        }
+        // Named as the vendor's plain entry: this is the account's own row for
+        // that provider, not a separate provider.
+        let entry =
+            entry_from_state_with_config(&cfg, &TabId::vendor(session.vendor), &state, Utc::now());
+        let has_figures = entry.error.is_none()
+            && entry
+                .sections
+                .iter()
+                .any(|s| matches!(s, ReportSection::Metric { .. }));
+        if !has_figures {
+            continue;
+        }
+        let _ = crate::account_store::record_provider_entry(&identity, Some(&identity), &entry);
+        let ids = live.entry(slug.to_string()).or_default();
+        if !ids.iter().any(|id| id.eq_ignore_ascii_case(&identity)) {
+            ids.push(identity);
+        }
+    }
+    let _ = crate::account_store::set_live_sessions(live);
 }
 
 async fn collect_entries_for(
@@ -1090,14 +1190,8 @@ fn render_json_with_account(
             if let Some(providers) = account_json["providers"].as_array_mut() {
                 for provider in providers {
                     let id = provider["id"].as_str().unwrap_or("");
-                    let recent = snapshot_store
-                        .active_sessions
-                        .get(id)
-                        .map(|identity| {
-                            crate::account_store::accounts_match_or_prefix(identity, &label)
-                                || crate::account_store::accounts_match_or_prefix(identity, &user)
-                        })
-                        .unwrap_or(false);
+                    let recent =
+                        snapshot_store.is_live(id, &label) || snapshot_store.is_live(id, &user);
                     provider["recent"] = json!(recent);
                 }
             }
