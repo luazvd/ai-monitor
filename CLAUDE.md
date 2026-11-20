@@ -251,8 +251,9 @@ it. `manifest.json` stays at the root, where Omarchy looks for it.
   signed out keeps its own diagnosis), `fetch.rs` falls back to the Google
   OAuth session Antigravity saved in the OS keyring (`credential.rs`:
   Credential Manager on Windows, `security` on macOS, `secret-tool` on
-  Linux; read-only) and asks the Cloud Code API (`cloud.rs`) for the same
-  quota summary. A refreshed token goes to the vendor cache's
+  Linux; read-only), or, when the keyring is unavailable, the per-product
+  token files Antigravity writes under `~/.gemini` (`read_token_files`),
+  and asks the Cloud Code API (`cloud.rs`) for the same quota summary. A refreshed token goes to the vendor cache's
   `oauth.json`, keyed by a fingerprint of the refresh token, never back to
   the keyring. The OAuth client that refresh needs is config-only.
   Tests must never probe `/proc`, `lsof`, the keyring, Google or the wall
@@ -263,6 +264,12 @@ it. `manifest.json` stays at the root, where Omarchy looks for it.
   production wrappers. The two tests that touch the real keyring
   (`reading_the_real_windows_credential_never_errors`, `antigravity_remote_live`)
   are `#[ignore]`d.
+- `src/core/sessions.rs` — sessions beyond each vendor's default login: extra
+  `CLAUDE_CONFIG_DIR` / `CODEX_HOME` dirs seen in `/proc/*/environ` (remembered
+  in the cache's `sessions.json`) and Antigravity's per-product token files.
+  `report::refresh_extra_sessions` fetches each whose identity differs from the
+  default login's and records it in `live_sessions`. Tests use `discover_with`
+  and `parse_environ`, never `discover`.
 - `src/providers/kiro/` — Kiro CLI. Reads kiro-cli's own `data.sqlite3` (read-only) for
   the AWS SSO OIDC session, refreshes the ~1h access token via the documented
   CreateToken API, and calls the undocumented `GetUsageLimits` — same operation

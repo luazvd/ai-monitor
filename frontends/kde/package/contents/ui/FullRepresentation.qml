@@ -94,19 +94,22 @@ Item {
     readonly property int contentHeight: column.implicitHeight + Kirigami.Units.largeSpacing * 2
     implicitWidth: Kirigami.Units.gridUnit * 22
     implicitHeight: full.contentHeight
-    Layout.minimumHeight: full.contentHeight
     Layout.preferredHeight: full.contentHeight
     Layout.maximumHeight: full.contentHeight
 
-    ColumnLayout {
-        id: column
-        // Deliberately not anchors.fill: the column must drive the height, not
-        // be stretched by it, or contentHeight feeds back on itself.
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        anchors.margins: Kirigami.Units.largeSpacing
-        spacing: Kirigami.Units.smallSpacing
+    QQC2.ScrollView {
+        id: scrollView
+        anchors.fill: parent
+        contentWidth: availableWidth
+        contentHeight: column.implicitHeight + Kirigami.Units.largeSpacing * 2
+        clip: true
+
+        ColumnLayout {
+            id: column
+            width: scrollView.availableWidth - Kirigami.Units.largeSpacing * 2
+            x: Kirigami.Units.largeSpacing
+            y: Kirigami.Units.largeSpacing
+            spacing: Kirigami.Units.smallSpacing
 
         // --- header --------------------------------------------------------
         RowLayout {
@@ -700,4 +703,5 @@ Item {
             textFormat: Text.PlainText
         }
     }
+}
 }

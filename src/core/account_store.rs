@@ -95,6 +95,40 @@ pub struct SnapshotStore {
     /// Last detected user/email identity per provider (e.g. "openai" -> "user@example.com").
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub active_sessions: BTreeMap<String, String>,
+    /// Further identities signed in to a provider at the same time, through a
+    /// second session (`agy` beside the desktop app, a second `CODEX_HOME`).
+    /// Replaced wholesale on every report, so a closed session drops out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub live_sessions: BTreeMap<String, Vec<String>>,
+}
+
+impl SnapshotStore {
+    /// Whether `identity` is signed in to `provider` right now, through its
+    /// default session or any other.
+    pub fn is_live(&self, provider: &str, identity: &str) -> bool {
+        self.active_sessions
+            .get(provider)
+            .is_some_and(|live| accounts_match_or_prefix(live, identity))
+            || self.live_sessions.get(provider).is_some_and(|all| {
+                all.iter()
+                    .any(|live| accounts_match_or_prefix(live, identity))
+            })
+    }
+}
+
+/// Record every extra identity signed in per provider, replacing the last set.
+pub fn set_live_sessions(live: BTreeMap<String, Vec<String>>) -> Result<()> {
+    set_live_sessions_at(&snapshots_path()?, live)
+}
+
+/// [`set_live_sessions`] at an explicit store path.
+pub fn set_live_sessions_at(path: &Path, live: BTreeMap<String, Vec<String>>) -> Result<()> {
+    let mut store = load_store_from(path);
+    if store.live_sessions == live {
+        return Ok(());
+    }
+    store.live_sessions = live;
+    save_store_to(path, &store)
 }
 
 /// Path to the persisted account snapshots file in the user's cache directory.
@@ -590,28 +624,11 @@ pub fn detect_provider_email(provider_slug: &str, config: &Config) -> Option<Str
                     return Some(trimmed.to_string());
                 }
             }
-            if let Ok(Some(raw)) = crate::antigravity::credential::read() {
-                let trimmed = raw.trim();
-                let json =
-                    match trimmed.strip_prefix(crate::antigravity::credential::GO_KEYRING_PREFIX) {
-                        Some(enc) => {
-                            use base64::Engine;
-                            base64::engine::general_purpose::STANDARD
-                                .decode(enc.trim())
-                                .ok()
-                                .and_then(|b| String::from_utf8(b).ok())
-                                .unwrap_or_default()
-                        }
-                        None => trimmed.to_string(),
-                    };
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json)
-                    && let Some(email) = v.get("email").and_then(|e| e.as_str())
-                {
-                    let trimmed = email.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
-                    }
-                }
+            if let Some(raw) = crate::antigravity::credential::read_saved(false)
+                && let Ok(token) = crate::antigravity::credential::parse_keyring_blob(&raw)
+                && let Some(email) = token.email
+            {
+                return Some(email);
             }
         }
         "anthropic" | "claude" => {
@@ -1425,5 +1442,29 @@ providers = ["antigravity"]
 
         // Removing non-existent account returns false
         assert!(!remove_snapshot_at(&store_path, "user@test.com").unwrap());
+    }
+
+    #[test]
+    fn live_sessions_mark_every_signed_in_identity_and_are_replaced() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("account_snapshots.json");
+        let mut store = SnapshotStore::default();
+        store
+            .active_sessions
+            .insert("antigravity".into(), "desktop@test.com".into());
+        save_store_to(&path, &store).unwrap();
+
+        let mut live = BTreeMap::new();
+        live.insert("antigravity".to_string(), vec!["cli@test.com".to_string()]);
+        set_live_sessions_at(&path, live).unwrap();
+        let store = load_store_from(&path);
+        assert!(store.is_live("antigravity", "desktop@test.com"));
+        assert!(store.is_live("antigravity", "cli@test.com"));
+        assert!(!store.is_live("openai", "cli@test.com"));
+
+        set_live_sessions_at(&path, BTreeMap::new()).unwrap();
+        let store = load_store_from(&path);
+        assert!(!store.is_live("antigravity", "cli@test.com"));
+        assert!(store.is_live("antigravity", "desktop@test.com"));
     }
 }

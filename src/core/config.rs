@@ -1540,6 +1540,41 @@ pub struct AntigravityConfig {
     /// installed-app secret is not confidential by Google's definition, but
     /// it is still treated as an inline credential for file-permission purposes.
     pub oauth_client_secret: Option<String>,
+    /// Extra saved Google sessions, each read from its own token file and
+    /// asked of Cloud Code directly. Sessions Antigravity itself writes under
+    /// `~/.gemini` are found without listing them here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AntigravityAccount>,
+}
+
+/// One extra Antigravity sign-in, by the token file its product wrote.
+///
+/// ```toml
+/// [[antigravity.accounts]]
+/// label = "agy"
+/// token_path = "~/.gemini/antigravity-cli/antigravity-oauth-token"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AntigravityAccount {
+    /// Stable name, also the cache subdir (`~/.cache/ai-monitor/antigravity/<label>`).
+    pub label: String,
+    /// The token file: the same JSON Antigravity keeps in the keyring.
+    pub token_path: PathBuf,
+}
+
+impl AntigravityConfig {
+    /// The token file for the account named `label`.
+    pub fn token_path(&self, label: &str) -> Result<PathBuf> {
+        self.accounts
+            .iter()
+            .find(|account| account.label == label)
+            .map(|account| account.token_path.clone())
+            .ok_or_else(|| {
+                AppError::Credentials(format!(
+                    "no Antigravity account named {label:?}. Add it under [[antigravity.accounts]]."
+                ))
+            })
+    }
 }
 
 /// Cursor reads its quota through a session token the Cursor IDE already
